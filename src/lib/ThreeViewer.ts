@@ -41,6 +41,16 @@ export class ThreeViewer {
 
   private hotspots: Hotspot[] = [];
 
+  private onDeviceOrientationBound: (event: DeviceOrientationEvent) => void;
+  private onPointerDownBound: (event: PointerEvent) => void;
+  private onPointerMoveBound: (event: PointerEvent) => void;
+  private onPointerUpBound: (event: PointerEvent) => void;
+  private onTouchStartBound: (event: TouchEvent) => void;
+  private onTouchMoveBound: (event: TouchEvent) => void;
+  private onDocumentMouseWheelBound: (event: WheelEvent) => void;
+  private onWindowResizeBound: () => void;
+  private onOrientationChangeBound: () => void;
+
   constructor(options: ThreeViewerOptions) {
     this.container = options.container;
     
@@ -56,34 +66,43 @@ export class ThreeViewer {
 
     this.textureLoader = new THREE.TextureLoader();
 
-    // Event Listeners for controls
-    this.container.addEventListener('pointerdown', this.onPointerDown.bind(this));
-    this.container.addEventListener('pointermove', this.onPointerMove.bind(this));
-    this.container.addEventListener('pointerup', this.onPointerUp.bind(this));
-    this.container.addEventListener('pointercancel', this.onPointerUp.bind(this));
-    this.container.addEventListener('wheel', this.onDocumentMouseWheel.bind(this), { passive: false });
-    
-    // Touch specifically for pinch zoom (pointer events don't easily give 2-finger distance in some setups without array tracking)
-    this.container.addEventListener('touchstart', this.onTouchStart.bind(this), { passive: false });
-    this.container.addEventListener('touchmove', this.onTouchMove.bind(this), { passive: false });
-
-    window.addEventListener('resize', this.onWindowResize.bind(this));
-    window.addEventListener('orientationchange', () => {
+    // Bind event handlers
+    this.onDeviceOrientationBound = this.onDeviceOrientation.bind(this);
+    this.onPointerDownBound = this.onPointerDown.bind(this);
+    this.onPointerMoveBound = this.onPointerMove.bind(this);
+    this.onPointerUpBound = this.onPointerUp.bind(this);
+    this.onTouchStartBound = this.onTouchStart.bind(this);
+    this.onTouchMoveBound = this.onTouchMove.bind(this);
+    this.onDocumentMouseWheelBound = this.onDocumentMouseWheel.bind(this);
+    this.onWindowResizeBound = this.onWindowResize.bind(this);
+    this.onOrientationChangeBound = () => {
       this.screenOrientation = window.orientation || 0;
-    });
+    };
+
+    // Event Listeners for controls
+    this.container.addEventListener('pointerdown', this.onPointerDownBound);
+    this.container.addEventListener('pointermove', this.onPointerMoveBound);
+    this.container.addEventListener('pointerup', this.onPointerUpBound);
+    this.container.addEventListener('pointercancel', this.onPointerUpBound);
+    this.container.addEventListener('wheel', this.onDocumentMouseWheelBound, { passive: false });
+    
+    // Touch specifically for pinch zoom
+    this.container.addEventListener('touchstart', this.onTouchStartBound, { passive: false });
+    this.container.addEventListener('touchmove', this.onTouchMoveBound, { passive: false });
+
+    window.addEventListener('resize', this.onWindowResizeBound);
+    window.addEventListener('orientationchange', this.onOrientationChangeBound);
 
     this.animate();
   }
 
-  public async loadImage(imageUrl: string) {
-    return new Promise<void>((resolve, reject) => {
-      this.textureLoader.load(
-        imageUrl,
-        (texture) => {
-          texture.colorSpace = THREE.SRGBColorSpace;
-          texture.minFilter = THREE.LinearMap;
-          texture.generateMipmaps = true;
+  private videoElement: HTMLVideoElement | null = null;
 
+  public async loadMedia(mediaUrl: string, type: 'image' | 'video' = 'image') {
+    return new Promise<void>((resolve, reject) => {
+      const applyTexture = (texture: THREE.Texture) => {
+          texture.colorSpace = THREE.SRGBColorSpace;
+          
           if (this.sphereMesh) {
             this.scene.remove(this.sphereMesh);
             const material = this.sphereMesh.material as THREE.MeshBasicMaterial;
@@ -100,12 +119,57 @@ export class ThreeViewer {
           this.scene.add(this.sphereMesh);
           
           resolve();
-        },
-        undefined,
-        (err) => reject(err)
-      );
+      };
+
+      if (type === 'video') {
+         if (this.videoElement) {
+             this.videoElement.pause();
+             this.videoElement.removeAttribute('src');
+             this.videoElement.load();
+         }
+         const video = document.createElement('video');
+         video.src = mediaUrl;
+         video.crossOrigin = 'anonymous';
+         video.loop = true;
+         video.muted = true;
+         video.playsInline = true;
+         video.onloadeddata = () => {
+             video.play();
+             const texture = new THREE.VideoTexture(video);
+             texture.minFilter = THREE.LinearFilter;
+             texture.magFilter = THREE.LinearFilter;
+             texture.generateMipmaps = false;
+             this.videoElement = video;
+             applyTexture(texture);
+         };
+         video.onerror = (e) => reject(e);
+      } else {
+            this.textureLoader.load(
+              mediaUrl,
+              (texture) => {
+                texture.minFilter = THREE.LinearMipmapLinearFilter;
+                texture.magFilter = THREE.LinearFilter;
+                texture.generateMipmaps = true;
+                texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+                applyTexture(texture);
+              },
+              undefined,
+              (err) => reject(err)
+            );
+      }
     });
   }
+
+  // Backwards compatibility
+  public async loadImage(imageUrl: string) {
+      return this.loadMedia(imageUrl, 'image');
+  }
+
+  public captureScreenshot(): string {
+      this.renderer.render(this.scene, this.camera);
+      return this.renderer.domElement.toDataURL('image/png');
+  }
+
 
   public setHotspots(hotspots: Hotspot[]) {
     this.hotspots = hotspots;
@@ -178,20 +242,20 @@ export class ThreeViewer {
   public toggleGyro() {
     if (this.gyroEnabled) {
       this.gyroEnabled = false;
-      window.removeEventListener('deviceorientation', this.onDeviceOrientation);
+      window.removeEventListener('deviceorientation', this.onDeviceOrientationBound);
     } else {
       if (typeof (DeviceOrientationEvent as any).requestPermission === 'function') {
         (DeviceOrientationEvent as any).requestPermission()
           .then((permissionState: string) => {
             if (permissionState === 'granted') {
               this.gyroEnabled = true;
-              window.addEventListener('deviceorientation', this.onDeviceOrientation.bind(this));
+              window.addEventListener('deviceorientation', this.onDeviceOrientationBound);
             }
           })
           .catch(console.error);
       } else {
         this.gyroEnabled = true;
-        window.addEventListener('deviceorientation', this.onDeviceOrientation.bind(this));
+        window.addEventListener('deviceorientation', this.onDeviceOrientationBound);
       }
     }
     return this.gyroEnabled;
@@ -300,17 +364,18 @@ export class ThreeViewer {
 
   public destroy() {
     cancelAnimationFrame(this.animationFrameId);
-    this.container.removeEventListener('pointerdown', this.onPointerDown.bind(this));
-    this.container.removeEventListener('pointermove', this.onPointerMove.bind(this));
-    this.container.removeEventListener('pointerup', this.onPointerUp.bind(this));
-    this.container.removeEventListener('pointercancel', this.onPointerUp.bind(this));
-    this.container.removeEventListener('wheel', this.onDocumentMouseWheel.bind(this));
-    this.container.removeEventListener('touchstart', this.onTouchStart.bind(this));
-    this.container.removeEventListener('touchmove', this.onTouchMove.bind(this));
-    window.removeEventListener('resize', this.onWindowResize.bind(this));
+    this.container.removeEventListener('pointerdown', this.onPointerDownBound);
+    this.container.removeEventListener('pointermove', this.onPointerMoveBound);
+    this.container.removeEventListener('pointerup', this.onPointerUpBound);
+    this.container.removeEventListener('pointercancel', this.onPointerUpBound);
+    this.container.removeEventListener('wheel', this.onDocumentMouseWheelBound);
+    this.container.removeEventListener('touchstart', this.onTouchStartBound);
+    this.container.removeEventListener('touchmove', this.onTouchMoveBound);
+    window.removeEventListener('resize', this.onWindowResizeBound);
+    window.removeEventListener('orientationchange', this.onOrientationChangeBound);
     
     if (this.gyroEnabled) {
-      window.removeEventListener('deviceorientation', this.onDeviceOrientation.bind(this));
+      window.removeEventListener('deviceorientation', this.onDeviceOrientationBound);
     }
     
     if (this.sphereMesh) {
