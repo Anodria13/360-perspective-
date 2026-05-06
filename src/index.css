@@ -8,5 +8,14 @@
     -ms-overflow-style: none;
     scrollbar-width: none;
   }
+  
+  input.no-spinners::-webkit-outer-spin-button,
+  input.no-spinners::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input.no-spinners {
+    -moz-appearance: textfield;
+  }
 }
 

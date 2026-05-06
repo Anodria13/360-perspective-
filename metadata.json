@@ -1,6 +1,6 @@
 {
   "name": "Remix: 360 Virtual Tour Builder",
   "description": "An interactive web application to upload, view, and link 360-degree panoramas into an immersive virtual tour. Built using Three.js and Tailwind CSS.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": []
 }

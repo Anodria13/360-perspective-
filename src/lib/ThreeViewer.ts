@@ -1,10 +1,18 @@
 import * as THREE from 'three';
 
+export interface TransitionConfig {
+  type: 'crossfade' | 'fade' | 'zoom' | 'slideLeft' | 'slideRight' | 'slideUp' | 'slideDown' | 'blur' | 'warp';
+  duration: number; // in seconds
+  easing?: 'linear' | 'easeInOut' | 'easeOut' | 'easeIn';
+}
+
 export interface Hotspot {
   id: string;
   position: THREE.Vector3;
   targetImageId: string;
   label: string;
+  displayLabel?: string;
+  transition?: TransitionConfig;
 }
 
 export type ThreeViewerOptions = {
@@ -18,8 +26,22 @@ export class ThreeViewer {
   private camera: THREE.PerspectiveCamera;
   private renderer: THREE.WebGLRenderer;
   private sphereMesh: THREE.Mesh | null = null;
+  private oldSphereMesh: THREE.Mesh | null = null;
   private textureLoader: THREE.TextureLoader;
   private animationFrameId: number = 0;
+  
+  private textureCache: Map<string, THREE.Texture> = new Map();
+  private sceneGroup: THREE.Group;
+
+  private transitionState: {
+     active: boolean;
+     progress: number;
+     config: TransitionConfig;
+     startTime: number;
+     startFov: number;
+     startLon: number;
+     startLat: number;
+  } | null = null;
   
   // Controls state
   private isUserInteracting = false;
@@ -55,6 +77,8 @@ export class ThreeViewer {
     this.container = options.container;
     
     this.scene = new THREE.Scene();
+    this.sceneGroup = new THREE.Group();
+    this.scene.add(this.sceneGroup);
     
     this.camera = new THREE.PerspectiveCamera(this.fov, this.container.clientWidth / this.container.clientHeight, 0.1, 1000);
     this.camera.target = new THREE.Vector3(0, 0, 0);
@@ -98,29 +122,11 @@ export class ThreeViewer {
 
   private videoElement: HTMLVideoElement | null = null;
 
-  public async loadMedia(mediaUrl: string, type: 'image' | 'video' = 'image') {
-    return new Promise<void>((resolve, reject) => {
-      const applyTexture = (texture: THREE.Texture) => {
-          texture.colorSpace = THREE.SRGBColorSpace;
-          
-          if (this.sphereMesh) {
-            this.scene.remove(this.sphereMesh);
-            const material = this.sphereMesh.material as THREE.MeshBasicMaterial;
-            if (material.map) material.map.dispose();
-            material.dispose();
-            this.sphereMesh.geometry.dispose();
-          }
+  public async loadMedia(mediaUrl: string, type: 'image' | 'video' = 'image', transitionConfig?: TransitionConfig) {
+    return new Promise<void>(async (resolve, reject) => {
+      let texture: THREE.Texture;
 
-          const geometry = new THREE.SphereGeometry(500, 60, 40);
-          geometry.scale(-1, 1, 1);
-
-          const material = new THREE.MeshBasicMaterial({ map: texture });
-          this.sphereMesh = new THREE.Mesh(geometry, material);
-          this.scene.add(this.sphereMesh);
-          
-          resolve();
-      };
-
+      // Handle video or image loading
       if (type === 'video') {
          if (this.videoElement) {
              this.videoElement.pause();
@@ -133,30 +139,98 @@ export class ThreeViewer {
          video.loop = true;
          video.muted = true;
          video.playsInline = true;
-         video.onloadeddata = () => {
-             video.play();
-             const texture = new THREE.VideoTexture(video);
-             texture.minFilter = THREE.LinearFilter;
-             texture.magFilter = THREE.LinearFilter;
-             texture.generateMipmaps = false;
-             this.videoElement = video;
-             applyTexture(texture);
-         };
-         video.onerror = (e) => reject(e);
+         
+         texture = await new Promise((res, rej) => {
+             video.onloadeddata = () => {
+                 video.play();
+                 const tex = new THREE.VideoTexture(video);
+                 tex.minFilter = THREE.LinearFilter;
+                 tex.magFilter = THREE.LinearFilter;
+                 tex.generateMipmaps = false;
+                 tex.colorSpace = THREE.SRGBColorSpace;
+                 this.videoElement = video;
+                 res(tex);
+             };
+             video.onerror = (e) => rej(e);
+         });
       } else {
-            this.textureLoader.load(
-              mediaUrl,
-              (texture) => {
-                texture.minFilter = THREE.LinearMipmapLinearFilter;
-                texture.magFilter = THREE.LinearFilter;
-                texture.generateMipmaps = true;
-                texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
-                applyTexture(texture);
-              },
-              undefined,
-              (err) => reject(err)
-            );
+         if (this.textureCache.has(mediaUrl)) {
+             texture = this.textureCache.get(mediaUrl)!;
+         } else {
+             texture = await new Promise((res, rej) => {
+                 this.textureLoader.load(
+                   mediaUrl,
+                   (tex) => {
+                     tex.minFilter = THREE.LinearMipmapLinearFilter;
+                     tex.magFilter = THREE.LinearFilter;
+                     tex.generateMipmaps = true;
+                     tex.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+                     tex.colorSpace = THREE.SRGBColorSpace;
+                     this.textureCache.set(mediaUrl, tex);
+                     res(tex);
+                   },
+                   undefined,
+                   (err) => rej(err)
+                 );
+             });
+         }
       }
+
+      // Prepare transition
+      if (this.sphereMesh) {
+         if (this.oldSphereMesh) {
+             // Cleanup if there was an interrupted transition
+             this.sceneGroup.remove(this.oldSphereMesh);
+             if (this.oldSphereMesh.material instanceof THREE.Material) this.oldSphereMesh.material.dispose();
+             this.oldSphereMesh.geometry.dispose();
+         }
+         this.oldSphereMesh = this.sphereMesh;
+         
+         // Make old mesh transparent to allow fading
+         if (this.oldSphereMesh.material instanceof THREE.MeshBasicMaterial) {
+             this.oldSphereMesh.material.transparent = true;
+             this.oldSphereMesh.material.depthWrite = false;
+         }
+         this.oldSphereMesh.renderOrder = 1; // Render on top during crossfade
+         this.oldSphereMesh.scale.setScalar(0.999); // Prevent Z-fighting
+      }
+
+      const geometry = new THREE.SphereGeometry(500, 60, 40);
+      geometry.scale(-1, 1, 1);
+
+      const material = new THREE.MeshBasicMaterial({ map: texture, transparent: true, opacity: 0, depthWrite: false });
+      this.sphereMesh = new THREE.Mesh(geometry, material);
+      this.sphereMesh.renderOrder = 0;
+      this.sceneGroup.add(this.sphereMesh);
+
+      if (transitionConfig && this.oldSphereMesh) {
+          this.transitionState = {
+             active: true,
+             progress: 0,
+             config: transitionConfig,
+             startTime: performance.now(),
+             startFov: this.camera.fov,
+             startLon: this.lon,
+             startLat: this.lat
+          };
+      } else {
+          // No transition OR first load
+          this.camera.fov = 100;
+          this.camera.updateProjectionMatrix();
+          if (this.sphereMesh.material instanceof THREE.MeshBasicMaterial) {
+              this.sphereMesh.material.opacity = 1;
+              this.sphereMesh.material.transparent = false;
+              this.sphereMesh.material.depthWrite = true;
+          }
+          if (this.oldSphereMesh) {
+              this.sceneGroup.remove(this.oldSphereMesh);
+              if (this.oldSphereMesh.material instanceof THREE.Material) this.oldSphereMesh.material.dispose();
+              this.oldSphereMesh.geometry.dispose();
+              this.oldSphereMesh = null;
+          }
+      }
+
+      resolve();
     });
   }
 
@@ -175,7 +249,7 @@ export class ThreeViewer {
     this.hotspots = hotspots;
   }
   
-  public getHotspotScreenPositions(): { id: string; targetImageId: string; label: string; x: number; y: number; visible: boolean }[] {
+  public getHotspotScreenPositions(): { id: string; targetImageId: string; label: string; rawLabel: string; x: number; y: number; visible: boolean }[] {
     const widthHalf = 0.5 * this.container.clientWidth;
     const heightHalf = 0.5 * this.container.clientHeight;
 
@@ -194,7 +268,8 @@ export class ThreeViewer {
       return {
         id: hotspot.id,
         targetImageId: hotspot.targetImageId,
-        label: hotspot.label,
+        label: hotspot.displayLabel || hotspot.label,
+        rawLabel: hotspot.label,
         x: (vector.x * widthHalf) + widthHalf,
         y: -(vector.y * heightHalf) + heightHalf,
         visible,
@@ -224,6 +299,13 @@ export class ThreeViewer {
   }
 
   public getCameraRotation() {
+    if (this.gyroEnabled) {
+      const dir = new THREE.Vector3();
+      this.camera.getWorldDirection(dir);
+      const lat = THREE.MathUtils.radToDeg(Math.asin(dir.y));
+      const lon = THREE.MathUtils.radToDeg(Math.atan2(dir.z, dir.x));
+      return { lon, lat };
+    }
     return { lon: this.lon, lat: this.lat };
   }
 
@@ -235,7 +317,7 @@ export class ThreeViewer {
   public resetView() {
     this.lon = 0;
     this.lat = 0;
-    this.camera.fov = 75;
+    this.camera.fov = 100;
     this.camera.updateProjectionMatrix();
   }
 
@@ -329,7 +411,119 @@ export class ThreeViewer {
     this.update();
   }
 
+  private ease(t: number, type?: string): number {
+    switch(type) {
+        case 'easeIn': return t * t;
+        case 'easeOut': return t * (2 - t);
+        case 'easeInOut': return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+        case 'linear':
+        default: return t;
+    }
+  }
+
   private update() {
+    if (this.transitionState && this.transitionState.active && this.oldSphereMesh && this.sphereMesh) {
+      const now = performance.now();
+      const elapsed = (now - this.transitionState.startTime) / 1000;
+      let rawProgress = elapsed / this.transitionState.config.duration;
+      if (rawProgress >= 1) {
+          rawProgress = 1;
+          this.transitionState.active = false;
+      }
+      
+      const p = this.ease(rawProgress, this.transitionState.config.easing);
+      this.transitionState.progress = p;
+
+      const oldMat = this.oldSphereMesh.material as THREE.MeshBasicMaterial;
+      const newMat = this.sphereMesh.material as THREE.MeshBasicMaterial;
+
+      switch(this.transitionState.config.type) {
+         case 'crossfade':
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            break;
+         case 'fade':
+            if (p < 0.5) {
+               oldMat.opacity = 1 - (p * 2);
+               newMat.opacity = 0;
+            } else {
+               oldMat.opacity = 0;
+               newMat.opacity = (p - 0.5) * 2;
+            }
+            break;
+         case 'zoom':
+            // Camera push in then pull out
+            if (p < 0.5) {
+               this.camera.fov = THREE.MathUtils.lerp(this.transitionState.startFov, 30, p * 2);
+               oldMat.opacity = 1 - (p * 2);
+               newMat.opacity = 0;
+            } else {
+               this.camera.fov = THREE.MathUtils.lerp(30, 100, (p - 0.5) * 2);
+               oldMat.opacity = 0;
+               newMat.opacity = (p - 0.5) * 2;
+            }
+            this.camera.updateProjectionMatrix();
+            break;
+         case 'slideLeft':
+            this.lon = this.transitionState.startLon - p * 90;
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            break;
+         case 'slideRight':
+            this.lon = this.transitionState.startLon + p * 90;
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            break;
+         case 'slideUp':
+            this.lat = this.transitionState.startLat + p * 90;
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            break;
+         case 'slideDown':
+            this.lat = this.transitionState.startLat - p * 90;
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            break;
+         case 'warp':
+            // Extreme fisheye lens distortion
+            if (p < 0.5) {
+               this.camera.fov = THREE.MathUtils.lerp(this.transitionState.startFov, 160, p * 2);
+               oldMat.opacity = 1 - (p * 2);
+               newMat.opacity = 0;
+            } else {
+               this.camera.fov = THREE.MathUtils.lerp(160, 100, (p - 0.5) * 2);
+               oldMat.opacity = 0;
+               newMat.opacity = (p - 0.5) * 2;
+            }
+            this.camera.updateProjectionMatrix();
+            break;
+         case 'blur':
+            // Proxy blur using extreme scale + fade (without custom shader fallback)
+            // It mimics a dissolve/blur effect by moving the sphere and varying opacity rapidly
+            oldMat.opacity = 1 - p;
+            newMat.opacity = p;
+            if (p < 0.5) {
+               this.sceneGroup.scale.setScalar(1 + p * 0.1);
+            } else {
+               this.sceneGroup.scale.setScalar(1 + (1 - p) * 0.1);
+            }
+            break;
+      }
+
+      if (rawProgress >= 1) {
+         this.sceneGroup.remove(this.oldSphereMesh);
+         if (this.oldSphereMesh.material instanceof THREE.Material) this.oldSphereMesh.material.dispose();
+         this.oldSphereMesh.geometry.dispose();
+         this.oldSphereMesh = null;
+         this.transitionState = null;
+         this.sceneGroup.scale.setScalar(1);
+         newMat.opacity = 1;
+         newMat.depthWrite = true;
+         this.camera.fov = 100;
+         this.camera.updateProjectionMatrix();
+      }
+    }
+
     if (this.gyroEnabled && this.deviceOrientation) {
       // Basic Gyro mapping
       const alpha = this.deviceOrientation.alpha ? THREE.MathUtils.degToRad(this.deviceOrientation.alpha) : 0;
